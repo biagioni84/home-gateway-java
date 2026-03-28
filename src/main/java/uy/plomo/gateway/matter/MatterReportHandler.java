@@ -1,0 +1,116 @@
+package uy.plomo.gateway.matter;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import jakarta.annotation.PostConstruct;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import uy.plomo.gateway.device.Device;
+import uy.plomo.gateway.device.DeviceService;
+
+import java.util.Collection;
+
+/**
+ * Handles spontaneous events pushed by python-matter-server.
+ *
+ * Registered into MatterInterface post-construction to break the circular dep
+ * (mirrors ZigbeeReportHandler pattern).
+ *
+ * Events:
+ *   node_added        — new device commissioned
+ *   node_removed      — device removed from fabric
+ *   attribute_updated — device state changed (most frequent)
+ */
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class MatterReportHandler {
+
+    private final MatterInterface matterInterface;
+    private final DeviceService   deviceService;
+
+    @PostConstruct
+    public void init() {
+        matterInterface.setReportHandler(this);
+    }
+
+    // ── Initial node load ─────────────────────────────────────────────────────
+
+    /** Called once after start_listening populates the node cache. */
+    public void onInitialNodes(Collection<MatterNode> nodes) {
+        nodes.forEach(this::setup);
+    }
+
+    // ── Event handling ────────────────────────────────────────────────────────
+
+    public void handleEvent(String event, JsonNode data) {
+        switch (event) {
+            case "node_added"        -> {
+                log.info("Matter: node added — nodeId={}", nodeId(data));
+                if (data != null) {
+                    long    id    = data.path("node_id").asLong();
+                    boolean avail = data.path("available").asBoolean(true);
+                    setup(new MatterNode(id, avail, data));
+                }
+            }
+            case "node_removed"      -> log.info("Matter: node removed — nodeId={}", nodeId(data));
+            case "attribute_updated" -> handleAttributeUpdated(data);
+            default                  -> log.debug("Matter: event '{}' — {}", event, data);
+        }
+    }
+
+    // ── Device setup ──────────────────────────────────────────────────────────
+
+    /**
+     * Create a DB entry for a Matter node if one does not already exist.
+     * Mirrors ZWaveController.setup().
+     * Device.node stores the nodeId as a decimal string (e.g. "9").
+     */
+    private void setup(MatterNode node) {
+        String nodeStr = String.valueOf(node.nodeId());
+        if (deviceService.findByNode(nodeStr).isPresent()) {
+            log.debug("Matter: node {} already in DB — skipping setup", nodeStr);
+            return;
+        }
+
+        Device dev = new Device();
+        dev.setProtocol("matter");
+        dev.setNode(nodeStr);
+
+        JsonNode attrs = node.raw() != null ? node.raw().path("attributes") : null;
+        if (attrs != null && !attrs.isMissingNode()) {
+            String nodeLabel = MatterController.textAttr(attrs, "0/40/14");
+            String productName = MatterController.textAttr(attrs, "0/40/3");
+            dev.setName((nodeLabel != null && !nodeLabel.isBlank()) ? nodeLabel : productName);
+            dev.setManufacturer(MatterController.textAttr(attrs, "0/40/1"));
+            dev.setManufacturerId(MatterController.vendorIdHex(attrs.path("0/40/2")));
+            dev.setModelId(productName);
+            dev.setType(MatterController.inferType(attrs));
+        }
+
+        deviceService.save(dev);
+        log.info("Matter: created device entry for node {} (name={} type={})",
+                nodeStr, dev.getName(), dev.getType());
+    }
+
+    // ── Attribute updates ─────────────────────────────────────────────────────
+
+    private void handleAttributeUpdated(JsonNode data) {
+        if (data == null) return;
+        log.debug("Matter attribute_updated: node={} ep={} cluster={} attr={} value={}",
+                data.path("node_id").asLong(),
+                data.path("endpoint_id").asInt(),
+                data.path("cluster_id").asInt(),
+                data.path("attribute_id").asInt(),
+                data.path("value"));
+        // TODO: persist to Device.attributes and publish MQTT event
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static long nodeId(JsonNode data) {
+        return data != null ? data.path("node_id").asLong(-1) : -1;
+    }
+
+
+}
