@@ -12,5 +12,6 @@
     {"class": "BATTERY",       "cmd": "BATTERY_GET"}
   ],
   "configuration": [],
-  "init": []
+  "init": [],
+  "fwdEvents": ["SENSOR_BINARY_REPORT", "BATTERY_REPORT", "ALARM_REPORT"]
 }

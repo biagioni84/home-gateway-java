@@ -47,10 +47,10 @@ public class MqttService {
     @Value("${aws.iot.endpoint}")
     private String endpoint;
 
-    private final AppConfig       appConfig;
-    private final MqttDispatcher  dispatcher;
-    private final PlatformService platformService;
-    private final ObjectMapper    objectMapper;
+    private final AppConfig              appConfig;
+    private final AsyncCommandDispatcher asyncDispatcher;
+    private final PlatformService        platformService;
+    private final ObjectMapper           objectMapper;
 
     private Mqtt5Client client;
     private String gatewayName;
@@ -61,10 +61,11 @@ public class MqttService {
     private static final Pattern REQUEST_PATTERN =
             Pattern.compile("iot/v1/(.+)/request/(.+)");
 
-    public MqttService(AppConfig appConfig, @Lazy MqttDispatcher dispatcher,
+    public MqttService(AppConfig appConfig,
+                       @Lazy AsyncCommandDispatcher asyncDispatcher,
                        PlatformService platformService, ObjectMapper objectMapper) {
         this.appConfig       = appConfig;
-        this.dispatcher      = dispatcher;
+        this.asyncDispatcher = asyncDispatcher;
         this.platformService = platformService;
         this.objectMapper    = objectMapper;
     }
@@ -229,10 +230,7 @@ public class MqttService {
             String method = pathFull.substring(0, colon).toUpperCase();
             String path   = pathFull.substring(colon + 1);
 
-            String responseBody = dispatcher.dispatch(method, path, body);
-            if (responseBody == null) responseBody = "{}";
-
-            publishResponse(requestId, responseBody);
+            asyncDispatcher.dispatch(requestId, method, path, body);
 
         } catch (Exception e) {
             log.error("Error handling MQTT request {}", requestId, e);
@@ -292,7 +290,7 @@ public class MqttService {
 
     // ── Publish helpers ───────────────────────────────────────────────────────
 
-    private void publishResponse(String requestId, String responseJson) {
+    void publishResponse(String requestId, String responseJson) {
         String topic = "iot/v1/" + gatewayName + "/response/" + requestId;
         publish(topic, responseJson);
     }
@@ -328,6 +326,27 @@ public class MqttService {
         }
         String topic = "iot/v1/" + gatewayName + "/event/" + Instant.now().toEpochMilli();
         publish(topic, jsonPayload);
+    }
+
+    /**
+     * Publish a telemetry batch — all events accumulated since the last flush.
+     * Called by TelemetryBuffer on its scheduled interval.
+     *
+     * Topic: iot/v1/{name}/telemetry/{timestamp}
+     * Payload: { "events": [ {...}, ... ] }
+     */
+    public void publishTelemetry(java.util.List<java.util.Map<String, Object>> events) {
+        if (!isConnected()) {
+            log.warn("MQTT not connected — dropping telemetry batch ({} events)", events.size());
+            return;
+        }
+        String topic = "iot/v1/" + gatewayName + "/telemetry/" + Instant.now().toEpochMilli();
+        try {
+            String json = objectMapper.writeValueAsString(java.util.Map.of("events", events));
+            publish(topic, json);
+        } catch (Exception e) {
+            log.error("Failed to serialize telemetry batch", e);
+        }
     }
 
     private void publish(String topic, String payload) {

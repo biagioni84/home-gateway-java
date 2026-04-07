@@ -9,6 +9,7 @@ import uy.plomo.gateway.device.DeviceService;
 import uy.plomo.gateway.platform.PlatformService;
 import uy.plomo.gateway.sequence.Sequence;
 import uy.plomo.gateway.sequence.SequenceService;
+import uy.plomo.gateway.camera.CameraController;
 import uy.plomo.gateway.matter.MatterController;
 import uy.plomo.gateway.zigbee.ZigbeeController;
 import uy.plomo.gateway.zwave.ZWaveController;
@@ -39,6 +40,7 @@ public class GatewayApiService {
     private final ZWaveController  zwaveController;
     private final ZigbeeController zigbeeController;
     private final MatterController matterController;
+    private final CameraController cameraController;
     private final DeviceService    deviceService;
     private final SequenceService  sequenceService;
     private final PlatformService  platformService;
@@ -54,6 +56,7 @@ public class GatewayApiService {
                 case "zwave"  -> zwaveController.parseDevice(id, dev);
                 case "zigbee" -> zigbeeController.parseDevice(id, dev);
                 case "matter" -> matterController.parseDevice(id, dev);
+                case "camera" -> cameraController.parseDevice(id, dev);
                 default       -> Map.of("id", id);
             };
             devices.put(id, parsed);
@@ -119,11 +122,31 @@ public class GatewayApiService {
             case "zwave"  -> zwaveController.parseDevice(devId, dev);
             case "zigbee" -> zigbeeController.parseDevice(devId, dev);
             case "matter" -> matterController.parseDevice(devId, dev);
+            case "camera" -> cameraController.parseDevice(devId, dev);
             default       -> Map.of("id", devId);
         };
     }
 
     public Map<String, Object> deleteDevice(String devId) {
+        Optional<Device> opt = deviceService.findById(devId);
+        if (opt.isPresent() && "matter".equals(opt.get().getProtocol())) {
+            String nodeStr = opt.get().getNode();
+            if (nodeStr != null) {
+                try {
+                    long nodeId = nodeStr.startsWith("0x") || nodeStr.startsWith("0X")
+                            ? Long.parseLong(nodeStr.substring(2), 16)
+                            : Long.parseLong(nodeStr);
+                    matterController.removeNode(nodeId)
+                            .orTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+                            .exceptionally(ex -> {
+                                log.warn("Matter removeNode {} failed: {}", nodeId, ex.getMessage());
+                                return null;
+                            });
+                } catch (NumberFormatException e) {
+                    log.warn("deleteDevice: invalid matter node id '{}' for device {}", nodeStr, devId);
+                }
+            }
+        }
         deviceService.deleteById(devId);
         return Map.of("status", "deleted");
     }
@@ -177,6 +200,7 @@ public class GatewayApiService {
             case "zwave"  -> zwaveController.handleDeviceCommand(dev, cmd, subId, method, body);
             case "zigbee" -> zigbeeController.handleDeviceCommand(dev, cmd, subId, method, body);
             case "matter" -> handleMatterDeviceCommand(dev, cmd, method, body);
+            case "camera" -> cameraController.handleDeviceCommand(dev, cmd, method, body);
             default       -> Map.of("error", "unknown protocol: " + proto);
         };
     }
@@ -270,7 +294,6 @@ public class GatewayApiService {
      *   ping                       — basic liveness check
      *   zwave_node_list            — trigger NODE_LIST_GET to zipgateway
      *   zwave_setup_node  node=N   — manually call setup(N) for a known node
-     *   db_dump                    — return all devices from DB with raw attributes
      */
     public Map<String, Object> handleTest(Map<String, Object> body) {
         String cmd = str(body, "cmd");
@@ -411,6 +434,14 @@ public class GatewayApiService {
             return handleMatterNetwork(cmd, method, body);
         }
 
+        // /cameras — camera network management
+        if (is("GET",  "/cameras", method, path)) return handleCameraNetwork("list",     method, body);
+        if (is("POST", "/cameras", method, path)) return handleCameraNetwork("add",      method, body);
+        if (path.startsWith("/cameras/")) {
+            String sub = path.substring("/cameras/".length());
+            return handleCameraNetwork(sub, method, body);
+        }
+
         // /:dev/:cmd/:id
         Matcher m3 = P3.matcher(path);
         if (m3.matches()) return handleDeviceCommand(m3.group(1), m3.group(2), m3.group(3), method, body);
@@ -540,6 +571,49 @@ public class GatewayApiService {
             }
             default -> Map.of("error", "unknown matter command: " + cmd
                     + " — use: commission | remove | nodes");
+        };
+    }
+
+    // ── Camera network commands ───────────────────────────────────────────────
+
+    /**
+     * Camera network management — routed from both MQTT and REST.
+     *   GET  /cameras        → list
+     *   POST /cameras        → add { name, src } or { name, ip, username?, password? }
+     *   POST /cameras/discover → ONVIF scan (no credentials)
+     *   DELETE /cameras/{id} → remove device
+     */
+    public Map<String, Object> handleCameraNetwork(
+            String cmd, String method, Map<String, Object> body) {
+        return switch (cmd) {
+            case "list"    -> {
+                List<uy.plomo.gateway.device.Device> cameras =
+                        deviceService.findByProtocol("camera");
+                yield Map.of("cameras", cameras.stream()
+                        .map(d -> cameraController.parseDevice(d.getId(), d))
+                        .toList());
+            }
+            case "add"     -> {
+                String ip   = str(body, "ip");
+                String type = str(body, "type");
+                if ("ONVIF".equalsIgnoreCase(type) || ip != null) {
+                    yield cameraController.addOnvifCamera(
+                            str(body, "name"), ip,
+                            str(body, "username"), str(body, "password"),
+                            str(body, "managementUrl"));
+                }
+                yield cameraController.addCamera(str(body, "name"), str(body, "src"));
+            }
+            case "discover" -> cameraController.discoverCameras();
+            default -> {
+                // DELETE /cameras/{id}
+                if ("DELETE".equals(method)) {
+                    deleteDevice(cmd); // cmd holds the device id here
+                    yield Map.of("status", "deleted");
+                }
+                yield Map.of("error", "unknown camera command: " + cmd
+                        + " — use: discover | add | list");
+            }
         };
     }
 

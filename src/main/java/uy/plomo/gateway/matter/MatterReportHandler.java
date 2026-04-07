@@ -7,8 +7,12 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import uy.plomo.gateway.device.Device;
 import uy.plomo.gateway.device.DeviceService;
+import uy.plomo.gateway.telemetry.TelemetryBuffer;
 
 import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Handles spontaneous events pushed by python-matter-server.
@@ -28,6 +32,7 @@ public class MatterReportHandler {
 
     private final MatterInterface matterInterface;
     private final DeviceService   deviceService;
+    private final TelemetryBuffer telemetryBuffer;
 
     @PostConstruct
     public void init() {
@@ -97,13 +102,46 @@ public class MatterReportHandler {
 
     private void handleAttributeUpdated(JsonNode data) {
         if (data == null) return;
+        long   nodeId      = data.path("node_id").asLong();
+        int    endpointId  = data.path("endpoint_id").asInt();
+        int    clusterId   = data.path("cluster_id").asInt();
+        int    attributeId = data.path("attribute_id").asInt();
+        JsonNode value     = data.path("value");
+
         log.debug("Matter attribute_updated: node={} ep={} cluster={} attr={} value={}",
-                data.path("node_id").asLong(),
-                data.path("endpoint_id").asInt(),
-                data.path("cluster_id").asInt(),
-                data.path("attribute_id").asInt(),
-                data.path("value"));
-        // TODO: persist to Device.attributes and publish MQTT event
+                nodeId, endpointId, clusterId, attributeId, value);
+
+        // Persist to Device.attributes using path "ep/cluster/attr"
+        String attrPath = endpointId + "/" + clusterId + "/" + attributeId;
+        deviceService.findByNode(String.valueOf(nodeId)).ifPresent(dev -> {
+            dev.setAttribute(
+                    MatterProtocol.clusterName(clusterId),
+                    MatterProtocol.attributeName(clusterId, attributeId),
+                    value.isNull() ? null : value.asText());
+            deviceService.save(dev);
+            forwardEventIfConfigured(dev, nodeId, clusterId, attributeId, attrPath, value);
+        });
+    }
+
+    private void forwardEventIfConfigured(Device dev, long nodeId,
+            int clusterId, int attributeId, String attrPath, JsonNode value) {
+        List<String> fwdEvents = dev.getFwdEvents();
+        if (fwdEvents == null || fwdEvents.isEmpty()) return;
+
+        boolean matches = fwdEvents.stream()
+                .anyMatch(e -> MatterProtocol.matchesFwdEvent(e, clusterId, attributeId));
+        if (!matches) return;
+
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("type",    "matter");
+        event.put("node-id", String.valueOf(nodeId));
+        event.put("payload", Map.of(
+                "cluster",   MatterProtocol.clusterName(clusterId),
+                "attribute", MatterProtocol.attributeName(clusterId, attributeId),
+                "attr",      attrPath,
+                "value",     value.isNull() ? null : value.asText()
+        ));
+        telemetryBuffer.add(event);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

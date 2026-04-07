@@ -11,6 +11,7 @@ import uy.plomo.gateway.descriptor.ZWaveDescriptor;
 import uy.plomo.gateway.device.Device;
 import uy.plomo.gateway.device.DeviceService;
 import uy.plomo.gateway.mqtt.MqttService;
+import uy.plomo.gateway.telemetry.TelemetryBuffer;
 
 import java.time.Instant;
 import java.util.*;
@@ -35,6 +36,7 @@ public class ZWaveReportHandler {
     private final DeviceService          deviceService;
     private final DeviceDescriptorService descriptorService;
     private final ObjectMapper           objectMapper;
+    private final TelemetryBuffer        telemetryBuffer;
     @Lazy private final MqttService       mqttService;
     @Lazy private final ZWaveController   zwaveController;
 
@@ -48,7 +50,23 @@ public class ZWaveReportHandler {
      */
     public void handleFrame(int srcNodeId, Map<String, Object> packet) {
         Map<String, Object> zwaveCmd = ZWaveController.getZwaveCmd(packet);
-        if (zwaveCmd == null) return;
+        if (zwaveCmd == null) {
+            // ZIP-level frames (ACK/NACK) have no Z-Wave command payload.
+            // Log delayed NACK_RESPONSE so delivery failures are visible.
+            Object data = packet.get("data");
+            if (data instanceof Map<?, ?> dataMap) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> props1 = ZWaveInterface.getProperties1((Map<String, Object>) dataMap);
+                if (props1 != null && Boolean.TRUE.equals(props1.get("NACK_RESPONSE_BIT_MASK_V2"))) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> header = ZWaveInterface.getHeader((Map<String, Object>) dataMap);
+                    Object seqnum = header != null ? header.get("seqnum") : "?";
+                    log.warn("Z-Wave: delivery FAILED — NACK_RESPONSE from controller for seq={} " +
+                             "(FLiRS device did not respond to beam; check device range/battery)", seqnum);
+                }
+            }
+            return;
+        }
 
         String commandClass = strOf(zwaveCmd.get("class"));
         String command      = strOf(zwaveCmd.get("command"));
@@ -117,6 +135,7 @@ public class ZWaveReportHandler {
             case "USER_CODE_REPORT"              -> handleUserCodeReport(dev, fields, now);
             case "BATTERY_REPORT"                -> handleBatteryReport(dev, fields, now);
             case "BASIC_REPORT"                  -> handleBasicReport(dev, fields, now);
+            case "SWITCH_BINARY_REPORT"          -> handleSwitchBinaryReport(dev, fields, now);
             case "SWITCH_MULTILEVEL_REPORT"      -> handleSwitchMultilevelReport(dev, fields, now);
             case "THERMOSTAT_SETPOINT_REPORT"    -> handleThermostatSetpointReport(dev, fields, now);
             case "THERMOSTAT_MODE_REPORT"        -> handleThermostatModeReport(dev, fields, now);
@@ -192,6 +211,15 @@ public class ZWaveReportHandler {
         int level = val != null ? parseHex(val) : -1;
         dev.setAttribute("battery", "value", level);
         dev.setAttribute("battery", "time",  now);
+    }
+
+    private void handleSwitchBinaryReport(Device dev, Map<String, Object> fields, String now) {
+        String val = field(fields, "currentValue");
+        if (val != null) {
+            String status = "00".equalsIgnoreCase(val) ? "off" : "on";
+            dev.setAttribute("status", "value", status);
+            dev.setAttribute("status", "time",  now);
+        }
     }
 
     private void handleBasicReport(Device dev, Map<String, Object> fields, String now) {
@@ -492,11 +520,7 @@ public class ZWaveReportHandler {
                 event.put("type",    "zwave");
                 event.put("node-id", nodeHex);
                 event.put("payload", Map.of("cmd", command, "data", payloadToMap(fields, null)));
-                try {
-                    mqttService.publishEvent(objectMapper.writeValueAsString(event));
-                } catch (Exception ex) {
-                    log.error("Failed to serialize event for node {}: {}", nodeHex, ex.getMessage());
-                }
+                telemetryBuffer.add(event);
             }
         });
     }

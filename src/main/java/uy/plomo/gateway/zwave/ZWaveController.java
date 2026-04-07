@@ -436,9 +436,13 @@ public class ZWaveController {
         }
     }
 
+    @SuppressWarnings("unchecked")
     private Map<String, Object> responseToMap(Map<String, Object> resp, Object defaultResult) {
         if (resp == null) return Map.of("status", "timeout");
-        Map<String, Object> props1 = ZWaveInterface.getProperties1(resp);
+        // Header lives at resp["data"]["header"], not at the top level.
+        Object dataObj = resp.get("data");
+        Map<String, Object> data = (dataObj instanceof Map) ? (Map<String, Object>) dataObj : null;
+        Map<String, Object> props1 = ZWaveInterface.getProperties1(data);
         if (props1 != null) {
             if (Boolean.TRUE.equals(props1.get("NACK_QUEUE_FULL_BIT_MASK_V2")))
                 return Map.of("status", "error", "reason", "queue_full");

@@ -31,13 +31,23 @@ Cloud (AWS IoT) ──MQTT5/mTLS──► MqttService
 
 | Package | Class | Role |
 |---------|-------|------|
+| `auth` | `AuthController` | `POST /auth/login` — issues JWT tokens. |
+| `auth` | `JwtService` | Signs and validates JWT tokens (HS256). |
+| `auth` | `JwtFilter` | `OncePerRequestFilter` — validates `Authorization: Bearer` on every request. |
+| `auth` | `SecurityConfig` | Spring Security config — stateless JWT, permits `/auth/login`. |
 | `mqtt` | `MqttService` | AWS IoT MQTT5 client (mTLS). Subscribe/publish topics. |
 | `mqtt` | `MqttDispatcher` | Routes MQTT commands to `GatewayApiService`. |
+| `mqtt` | `AsyncCommandDispatcher` | `@Async` offload — keeps the AWS event loop free during blocking Z-Wave/Zigbee/Matter calls. |
+| `mqtt` | `GatewayExecutorConfig` | Defines the `gw-cmd-*` thread pool (core=10, max=20, queue=50). |
 | `api` | `GatewayApiService` | Central business logic. Used by REST controllers AND MqttDispatcher. |
 | `api` | `NetworkController` | REST: `/summary`, `/include`, `/exclude`, `/timezone` |
 | `api` | `DeviceController` | REST: `/:dev`, `/:dev/:cmd`, `/:dev/:cmd/:id` |
+| `api` | `CameraRestController` | REST: `/cameras`, `/cameras/discover`, `/:dev/snapshot` |
 | `api` | `SequenceController` | REST: `/sequences`, `/sequences/:id`, `/sequences/:id/run` |
 | `api` | `ScheduleController` | REST: `/schedule`, `/schedule/:id` (stub) |
+| `camera` | `CameraService` | go2rtc REST API wrapper (streams, snapshots, HLS). |
+| `camera` | `OnvifDiscoveryService` | WS-Discovery UDP multicast probe — finds ONVIF cameras on LAN. |
+| `telemetry` | `TelemetryBuffer` | Thread-safe event queue — flushes batched events to MQTT on schedule. |
 | `zwave` | `ZWaveInterface` | UDP send/receive to zipgateway over IPv6. Hook system for async responses. |
 | `zwave` | `ZWaveController` | Z-Wave device commands: lock, pincode, thermostat, switch, dimmer. |
 | `zwave` | `ZWaveReportHandler` | Processes unsolicited Z-Wave reports, updates DB, forwards MQTT events. |
@@ -94,7 +104,8 @@ All configuration lives in `src/main/resources/application.properties`. Override
 
 | Property | Default | Description |
 |----------|---------|-------------|
-| `server.port` | `9096` | HTTP port |
+| `server.port` | `9098` | HTTP port |
+| `server.address` | `127.0.0.1` | Bind address — change to `0.0.0.0` for LAN access |
 | `spring.datasource.url` | `jdbc:sqlite:./gateway.db` | SQLite database path |
 | `aws.iot.endpoint` | *(set in file)* | AWS IoT endpoint URL |
 | `zwave.zipgateway.host.prefix` | `fd00:bbbb::` | IPv6 prefix for Z-Wave nodes |
@@ -104,8 +115,15 @@ All configuration lives in `src/main/resources/application.properties`. Override
 | `zigbee.enabled` | `true` | Set to `false` to disable Zigbee subsystem |
 | `matter.server.url` | `ws://localhost:5580/ws` | python-matter-server WebSocket URL |
 | `matter.enabled` | `true` | Set to `false` to disable Matter subsystem |
+| `camera.enabled` | `true` | Set to `false` to disable camera subsystem |
+| `camera.go2rtc.url` | `http://localhost:1984` | go2rtc REST API URL |
+| `camera.max.streams` | `8` | Maximum simultaneous go2rtc streams |
+| `telemetry.flush.interval.seconds` | `60` | How often the telemetry buffer flushes to MQTT |
+| `gateway.auth.username` | `admin` | REST API login username |
+| `gateway.auth.password` | `changeme` | REST API login password — **change before LAN exposure** |
+| `gateway.auth.jwt.secret` | *(blank)* | JWT signing secret — random generated on startup if blank |
+| `gateway.auth.jwt.expiry.hours` | `24` | JWT token lifetime in hours |
 | `gateway.creds.path` | `./provisioned.creds` | Path to provisioning credentials |
-| `gateway.api.key` | *(blank)* | REST API key — if blank all requests are allowed |
 | `gateway.devices.path` | `./devices` | Filesystem directory for device descriptor overrides |
 
 ### Disabling subsystems for local development
@@ -139,15 +157,33 @@ If the file is absent, the gateway starts without MQTT connectivity and logs a w
 
 ## Security
 
-### REST API key
+### REST API — JWT authentication
 
-Set `gateway.api.key` to a strong random string when `server.address` is not `127.0.0.1`. Every request must then include:
+All REST endpoints (except `/auth/login` and Swagger UI) require a valid JWT Bearer token.
 
+**Login:**
+```http
+POST /auth/login
+Content-Type: application/json
+
+{ "username": "admin", "password": "changeme" }
 ```
-X-Api-Key: <key>
+
+**Response:**
+```json
+{ "token": "<jwt>", "expiresIn": 86400 }
 ```
 
-Requests missing a valid key receive `401 {"error":"unauthorized"}`.
+**Subsequent requests:**
+```
+Authorization: Bearer <jwt>
+```
+
+Tokens expire after `gateway.auth.jwt.expiry.hours` (default 24 h). Change `gateway.auth.username` and `gateway.auth.password` in `application.properties` before exposing the API on the LAN.
+
+If `gateway.auth.jwt.secret` is left blank, a random signing key is generated on startup — tokens are invalidated on restart.
+
+MQTT commands bypass JWT entirely; MQTT access is controlled by AWS IoT Core access policies.
 
 ### SSH tunnels
 
@@ -277,6 +313,39 @@ AWS IoT Secure Tunneling is initiated from the cloud side. When a tunnel opens, 
 POST /matter/commission
 { "code": "MT:Y.K9042C00KA0648G00" }
 ```
+
+---
+
+### Cameras
+
+Requires [go2rtc](https://github.com/AlexxIT/go2rtc) running locally (`camera.go2rtc.url`).
+
+| Method | Path | Body | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/cameras` | — | List all registered cameras |
+| `POST` | `/api/v1/cameras` | `{type, name, ...}` | Add camera (see below) |
+| `POST` | `/api/v1/cameras/discover` | — | Discover ONVIF cameras on LAN (no credentials needed) |
+| `DELETE` | `/api/v1/cameras/:dev` | — | Remove camera |
+| `GET` | `/api/v1/:dev/snapshot` | — | Proxy JPEG snapshot from go2rtc |
+
+**Add ONVIF camera:**
+```json
+POST /api/v1/cameras
+{ "type": "ONVIF", "name": "Front Door", "ip": "192.168.1.50",
+  "username": "admin", "password": "12345" }
+```
+
+**Add raw RTSP stream:**
+```json
+POST /api/v1/cameras
+{ "name": "Parking", "src": "rtsp://192.168.1.60:554/stream1" }
+```
+
+**Discovery response:**
+```json
+{ "cameras": [{ "ip": "192.168.1.50", "managementUrl": "http://...", "registered": false }] }
+```
+Use the `ip` from discovery with `POST /api/v1/cameras` + credentials to register.
 
 ---
 
@@ -586,8 +655,18 @@ src/main/java/uy/plomo/gateway/
 │   ├── GatewayApiService.java      # central routing (REST + MQTT)
 │   ├── NetworkController.java
 │   ├── DeviceController.java
+│   ├── CameraRestController.java
 │   ├── SequenceController.java
 │   └── ScheduleController.java
+├── auth/
+│   ├── AuthController.java         # POST /auth/login
+│   ├── JwtService.java             # token generation and validation
+│   ├── JwtFilter.java              # Bearer token filter (OncePerRequestFilter)
+│   └── SecurityConfig.java         # Spring Security configuration
+├── camera/
+│   ├── CameraController.java       # camera commands + summary view
+│   ├── CameraService.java          # go2rtc REST API wrapper
+│   └── OnvifDiscoveryService.java  # WS-Discovery UDP multicast probe
 ├── config/
 │   ├── AppConfig.java              # loads provisioned.creds
 │   └── ProvisionedCreds.java
@@ -601,16 +680,21 @@ src/main/java/uy/plomo/gateway/
 │   ├── MatterInterface.java        # WebSocket client to python-matter-server
 │   ├── MatterMessage.java          # JSON-RPC message DTO
 │   ├── MatterNode.java             # live node snapshot record
-│   └── MatterReportHandler.java   # event handler, auto device creation
+│   ├── MatterProtocol.java         # cluster/attribute name maps, fwdEvent matching
+│   └── MatterReportHandler.java    # event handler, auto device creation
 ├── mqtt/
-│   ├── MqttService.java            # AWS IoT MQTT5 client
-│   └── MqttDispatcher.java
+│   ├── AsyncCommandDispatcher.java # @Async offload of MQTT commands off event loop
+│   ├── GatewayExecutorConfig.java  # gw-cmd-* thread pool (core=10, max=20)
+│   ├── MqttDispatcher.java
+│   └── MqttService.java            # AWS IoT MQTT5 client
 ├── platform/
-│   └── PlatformService.java        # serial number, timezone
+│   └── PlatformService.java        # serial number, timezone, SSH tunnels
 ├── sequence/
 │   ├── Sequence.java
 │   ├── SequenceRepository.java
 │   └── SequenceService.java
+├── telemetry/
+│   └── TelemetryBuffer.java        # batched event buffer → MQTT flush
 ├── util/
 │   └── JsonConverter.java          # JPA converters for JSON columns
 ├── zigbee/

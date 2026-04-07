@@ -8,6 +8,8 @@ import uy.plomo.gateway.config.AppConfig;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -57,15 +59,8 @@ public class PlatformService {
             log.warn("setTimezone: rejected invalid timezone value '{}'", timezone);
             return false;
         }
-        try {
-            // Pass args directly — no shell interpolation, no injection risk.
-            Process p = new ProcessBuilder("sudo", "timedatectl", "set-timezone", timezone)
-                    .redirectErrorStream(true).start();
-            return p.waitFor() == 0;
-        } catch (Exception e) {
-            log.warn("setTimezone failed", e);
-            return false;
-        }
+        // Pass args directly — no shell interpolation, no injection risk.
+        return exec(10, "sudo", "timedatectl", "set-timezone", timezone).exitCode() == 0;
     }
 
     /**
@@ -74,20 +69,11 @@ public class PlatformService {
      * Mirrors get-public-key in controller.clj.
      */
     public String getPublicKey() {
-        try {
-            String keyPath = System.getProperty("user.home") + "/.ssh/id_rsa";
-            Process p = new ProcessBuilder("ssh-keygen", "-y", "-f", keyPath)
-                    .redirectErrorStream(true).start();
-            String out;
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-                out = br.lines().collect(Collectors.joining("\n")).trim();
-            }
-            if (!out.isBlank()) {
-                String[] parts = out.split("\\s+");
-                return parts.length > 1 ? parts[1] : out;
-            }
-        } catch (Exception e) {
-            log.warn("getPublicKey failed", e);
+        String keyPath = System.getProperty("user.home") + "/.ssh/id_rsa";
+        String out = exec(10, "ssh-keygen", "-y", "-f", keyPath).output().trim();
+        if (!out.isBlank()) {
+            String[] parts = out.split("\\s+");
+            return parts.length > 1 ? parts[1] : out;
         }
         return null;
     }
@@ -164,10 +150,7 @@ public class PlatformService {
         String serial = appConfig.getCreds().getSerialNumber();
         String marker = "iot_" + serial;
         try {
-            Process p = new ProcessBuilder("ps", "-ax", "-o", "pid,cmd")
-                    .redirectErrorStream(true).start();
-            String out = new BufferedReader(new InputStreamReader(p.getInputStream()))
-                    .lines().collect(Collectors.joining("\n"));
+            String out = exec(10, "ps", "-ax", "-o", "pid,cmd").output();
 
             List<Map<String, Object>> tunnels = new ArrayList<>();
             for (String line : out.split("\n")) {
@@ -209,13 +192,8 @@ public class PlatformService {
             if (pidObj == null) continue;
             String pid = pidObj.toString();
             if (!pid.matches("\\d+")) continue;  // never pass non-numeric to kill
-            try {
-                new ProcessBuilder("kill", "-9", pid)
-                        .redirectErrorStream(true).start().waitFor();
-                killed++;
-            } catch (Exception e) {
-                log.warn("Failed to kill pid {}", pid, e);
-            }
+            if (exec(5, "kill", "-9", pid).exitCode() == 0) killed++;
+            else log.warn("Failed to kill pid {}", pid);
         }
         return Map.of("status", "ok", "killed", killed);
     }
@@ -236,15 +214,42 @@ public class PlatformService {
             if (pidObj == null) continue;
             String pid = pidObj.toString();
             if (!pid.matches("\\d+")) continue;
-            try {
-                new ProcessBuilder("kill", "-9", pid)
-                        .redirectErrorStream(true).start().waitFor();
-                killed++;
-            } catch (Exception e) {
-                log.warn("Failed to kill pid {}", pid, e);
-            }
+            if (exec(5, "kill", "-9", pid).exitCode() == 0) killed++;
+            else log.warn("Failed to kill pid {}", pid);
         }
         return Map.of("status", "ok", "killed", killed);
+    }
+
+    // ── Process helper ───────────────────────────────────────────────────────
+
+    private record ExecResult(int exitCode, String output) {}
+
+    /**
+     * Runs a process, reads its stdout off-thread, and enforces a hard timeout.
+     * Destroys the process forcibly if it doesn't finish in time.
+     */
+    private ExecResult exec(int timeoutSecs, String... cmd) {
+        try {
+            Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+            // Read stdout on a separate thread so it doesn't block if the process hangs.
+            CompletableFuture<String> outputFuture = CompletableFuture.supplyAsync(() -> {
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                    return br.lines().collect(Collectors.joining("\n"));
+                } catch (Exception e) {
+                    return "";
+                }
+            });
+            if (!p.waitFor(timeoutSecs, TimeUnit.SECONDS)) {
+                p.destroyForcibly();
+                log.warn("Process timed out after {}s: {}", timeoutSecs, Arrays.toString(cmd));
+                return new ExecResult(-1, "");
+            }
+            String output = outputFuture.get(2, TimeUnit.SECONDS);
+            return new ExecResult(p.exitValue(), output);
+        } catch (Exception e) {
+            log.warn("exec failed {}: {}", Arrays.toString(cmd), e.getMessage());
+            return new ExecResult(-1, "");
+        }
     }
 
     // ── AWS Secure Tunneling ──────────────────────────────────────────────────

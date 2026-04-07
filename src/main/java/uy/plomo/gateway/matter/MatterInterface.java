@@ -16,6 +16,8 @@ import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import jakarta.websocket.ContainerProvider;
 import jakarta.websocket.WebSocketContainer;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.*;
@@ -62,6 +64,10 @@ public class MatterInterface extends TextWebSocketHandler {
 
     // Injected post-construction to avoid circular dep (mirrors ZigbeeInterface pattern)
     private MatterReportHandler reportHandler;
+
+    @Autowired
+    @Qualifier("gatewayExecutor")
+    private Executor eventExecutor;
 
     public MatterInterface(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
@@ -117,7 +123,7 @@ public class MatterInterface extends TextWebSocketHandler {
         if (!running) return;
         if (session == null || !session.isOpen()) {
             log.info("Matter: reconnecting to {}", serverUrl);
-            connect();
+            eventExecutor.execute(this::connect);
         }
     }
 
@@ -208,7 +214,7 @@ public class MatterInterface extends TextWebSocketHandler {
         }
 
         if (reportHandler != null) {
-            reportHandler.handleEvent(event, data);
+            eventExecutor.execute(() -> reportHandler.handleEvent(event, data));
         }
     }
 

@@ -1,6 +1,5 @@
 package uy.plomo.gateway.zigbee;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Lazy;
@@ -8,6 +7,7 @@ import org.springframework.stereotype.Component;
 import uy.plomo.gateway.device.Device;
 import uy.plomo.gateway.device.DeviceService;
 import uy.plomo.gateway.mqtt.MqttService;
+import uy.plomo.gateway.telemetry.TelemetryBuffer;
 
 import java.time.Instant;
 import java.util.*;
@@ -25,8 +25,8 @@ import java.util.concurrent.CompletableFuture;
 @RequiredArgsConstructor
 public class ZigbeeReportHandler {
 
-    private final DeviceService deviceService;
-    private final ObjectMapper  objectMapper;
+    private final DeviceService   deviceService;
+    private final TelemetryBuffer telemetryBuffer;
     @Lazy private final MqttService       mqttService;
     @Lazy private final ZigbeeController  zigbeeController;
 
@@ -227,11 +227,7 @@ public class ZigbeeReportHandler {
                 event.put("type",    "zigbee");
                 event.put("node-id", node);
                 event.put("payload", Map.of("cmd", command, "fields", msg.getFields()));
-                try {
-                    mqttService.publishEvent(objectMapper.writeValueAsString(event));
-                } catch (Exception ex) {
-                    log.error("Failed to serialize event for node {}: {}", node, ex.getMessage());
-                }
+                telemetryBuffer.add(event);
             }
         });
     }
