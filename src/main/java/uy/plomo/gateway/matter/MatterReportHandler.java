@@ -7,6 +7,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import uy.plomo.gateway.device.Device;
 import uy.plomo.gateway.device.DeviceService;
+import uy.plomo.gateway.diagnostics.UnhandledFrameStore;
 import uy.plomo.gateway.telemetry.TelemetryBuffer;
 
 import java.util.Collection;
@@ -30,9 +31,10 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class MatterReportHandler {
 
-    private final MatterInterface matterInterface;
-    private final DeviceService   deviceService;
-    private final TelemetryBuffer telemetryBuffer;
+    private final MatterInterface     matterInterface;
+    private final DeviceService       deviceService;
+    private final TelemetryBuffer     telemetryBuffer;
+    private final UnhandledFrameStore unhandledFrameStore;
 
     @PostConstruct
     public void init() {
@@ -56,11 +58,21 @@ public class MatterReportHandler {
                     long    id    = data.path("node_id").asLong();
                     boolean avail = data.path("available").asBoolean(true);
                     setup(new MatterNode(id, avail, data));
+                    // Notify listeners that a new device was commissioned
+                    deviceService.findByNode(String.valueOf(id)).ifPresent(dev -> {
+                        Map<String, Object> telEvent = new LinkedHashMap<>();
+                        telEvent.put("type",     "matter");
+                        telEvent.put("event",    "node_added");
+                        telEvent.put("node_id",  String.valueOf(id));
+                        telEvent.put("name",     dev.getName());
+                        telEvent.put("dev_type", dev.getType());
+                        telemetryBuffer.add(telEvent);
+                    });
                 }
             }
             case "node_removed"      -> log.info("Matter: node removed — nodeId={}", nodeId(data));
             case "attribute_updated" -> handleAttributeUpdated(data);
-            default                  -> log.debug("Matter: event '{}' — {}", event, data);
+            default -> unhandledFrameStore.record("matter", String.valueOf(nodeId(data)), event, event, null);
         }
     }
 

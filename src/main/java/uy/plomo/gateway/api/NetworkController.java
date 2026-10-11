@@ -36,7 +36,7 @@ public class NetworkController {
     @PostMapping("/include")
     public Map<String, Object> include(@RequestBody(required = false) Map<String, Object> body) {
         if (body == null) body = Map.of();
-        return api.inclusion(api.str(body, "protocol"), api.str(body, "command"), api.bool(body, "blocking"));
+        return api.inclusion(api.str(body, "protocol"), api.str(body, "command"), api.bool(body, "blocking"), body);
     }
 
     @Operation(summary = "Start/stop exclusion mode (Z-Wave only)", description = "Body: { \"protocol\": \"zwave\", \"command\": \"start\"|\"stop\", \"blocking\": false }")

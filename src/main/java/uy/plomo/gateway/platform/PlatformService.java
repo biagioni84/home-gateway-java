@@ -3,7 +3,6 @@ package uy.plomo.gateway.platform;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-import uy.plomo.gateway.config.AppConfig;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -24,8 +23,6 @@ import java.util.stream.Collectors;
 @Slf4j
 @RequiredArgsConstructor
 public class PlatformService {
-
-    private final AppConfig appConfig;
 
     public String getSerialNumber() {
         try {
@@ -82,10 +79,13 @@ public class PlatformService {
 
     /** Validates hostname / IPv4 — rejects path traversal or shell metacharacters. */
     private static final Pattern ADDR_PATTERN   = Pattern.compile("[A-Za-z0-9.\\-]+");
-    /** Matches the -R forward spec inside ps output: dstPort:srcAddr:srcPort */
-    private static final Pattern TUNNEL_SPEC    = Pattern.compile("-R\\s+(\\d+):([\\w.\\-]+):(\\d+)");
-    /** Matches the target user@host in ps output: iot_{serial}@{dstAddr} */
-    private static final Pattern TUNNEL_TARGET  = Pattern.compile("iot_[^@]+@([\\w.\\-]+)");
+    /**
+     * Matches the -R forward spec inside ps output: 0.0.0.0:dstPort:srcAddr:srcPort.
+     * Must stay in sync with the remoteForward format built in createReverseTunnel().
+     */
+    private static final Pattern TUNNEL_SPEC    = Pattern.compile("-R\\s+0\\.0\\.0\\.0:(\\d+):([\\w.\\-]+):(\\d+)");
+    /** Matches the target user@host in ps output: tunneluser@{dstAddr} */
+    private static final Pattern TUNNEL_TARGET  = Pattern.compile("tunneluser@([\\w.\\-]+)");
     /** Matches a numeric PID at the start of a ps line. */
     private static final Pattern PID_PATTERN    = Pattern.compile("^\\s*(\\d+)");
 
@@ -105,14 +105,22 @@ public class PlatformService {
         if (srcPort < 1 || srcPort > 65535 || dstPort < 1 || dstPort > 65535)
             return Map.of("error", "invalid port");
 
-        String serial        = getSerialNumber();
-        String remoteForward = dstPort + ":" + srcAddr + ":" + srcPort;
-        String target        = "iot_" + serial + "@" + dstAddr;
+        // dst-port is the externally reachable port — only one ssh session can bind it.
+        // Always kill whatever is currently using it before starting, so "start" never
+        // depends on a prior "stop" having succeeded (dropped MQTT message, stale state, etc.).
+        int killed = killTunnelsOnDstPort(dstPort);
+        if (killed > 0) {
+            log.info("createReverseTunnel: killed {} stale tunnel(s) on dst-port {} before restart", killed, dstPort);
+            try { Thread.sleep(300); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        }
+
+        String remoteForward = "0.0.0.0:" + dstPort + ":" + srcAddr + ":" + srcPort;
+        String target        = "tunneluser@" + dstAddr;
 
         try {
             Process p = new ProcessBuilder(
                     "ssh", "-NT",
-                    "-o", "StrictHostKeyChecking=yes",
+                    "-o", "StrictHostKeyChecking=no",
                     "-o", "BatchMode=yes",
                     "-o", "ServerAliveInterval=30",
                     "-R", remoteForward,
@@ -147,14 +155,12 @@ public class PlatformService {
      * Mirrors legacy Clojure implementation.
      */
     public List<Map<String, Object>> listRunningTunnels() {
-        String serial = appConfig.getCreds().getSerialNumber();
-        String marker = "iot_" + serial;
         try {
             String out = exec(10, "ps", "-ax", "-o", "pid,cmd").output();
 
             List<Map<String, Object>> tunnels = new ArrayList<>();
             for (String line : out.split("\n")) {
-                if (!line.contains(marker)) continue;
+                if (!line.contains("tunneluser@")) continue;
 
                 Matcher pidM = PID_PATTERN.matcher(line);
                 String  pid  = pidM.find() ? pidM.group(1) : "";
@@ -218,6 +224,25 @@ public class PlatformService {
             else log.warn("Failed to kill pid {}", pid);
         }
         return Map.of("status", "ok", "killed", killed);
+    }
+
+    /**
+     * Kills any running tunnel bound to the given dst-port, regardless of src.
+     * Used by createReverseTunnel() to make "start" self-healing: the dst-port is the
+     * externally reachable port, so only one process can hold its remote bind at a time.
+     */
+    private int killTunnelsOnDstPort(int dstPort) {
+        int killed = 0;
+        for (Map<String, Object> t : listRunningTunnels()) {
+            if (!String.valueOf(dstPort).equals(String.valueOf(t.get("dst_port")))) continue;
+            Object pidObj = t.get("pid");
+            if (pidObj == null) continue;
+            String pid = pidObj.toString();
+            if (!pid.matches("\\d+")) continue;
+            if (exec(5, "kill", "-9", pid).exitCode() == 0) killed++;
+            else log.warn("Failed to kill pid {} on dst-port {}", pid, dstPort);
+        }
+        return killed;
     }
 
     // ── Process helper ───────────────────────────────────────────────────────

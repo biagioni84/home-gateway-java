@@ -11,6 +11,11 @@ import uy.plomo.gateway.sequence.Sequence;
 import uy.plomo.gateway.sequence.SequenceService;
 import uy.plomo.gateway.camera.CameraController;
 import uy.plomo.gateway.matter.MatterController;
+import uy.plomo.gateway.matter.MatterInterface;
+import uy.plomo.gateway.matter.MatterNode;
+import uy.plomo.gateway.audio.AudioCommandService;
+import uy.plomo.gateway.audio.AudioResponse;
+import uy.plomo.gateway.ota.OtaService;
 import uy.plomo.gateway.zigbee.ZigbeeController;
 import uy.plomo.gateway.zwave.ZWaveController;
 
@@ -40,12 +45,18 @@ public class GatewayApiService {
     private final ZWaveController  zwaveController;
     private final ZigbeeController zigbeeController;
     private final MatterController matterController;
+    private final MatterInterface  matterInterface;
     private final CameraController cameraController;
+    private final OtaService       otaService;
     private final DeviceService    deviceService;
     private final SequenceService  sequenceService;
     private final PlatformService  platformService;
 
     private final ObjectMapper objectMapper;
+
+    // Opcional — solo presente si audio.mqtt.enabled=true
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private AudioCommandService audioCommandService;
 
     // ── Summary ───────────────────────────────────────────────────────────────
 
@@ -84,12 +95,14 @@ public class GatewayApiService {
 
     // ── Inclusion / Exclusion ─────────────────────────────────────────────────
 
-    public Map<String, Object> inclusion(String protocol, String command, boolean blocking) {
+    public Map<String, Object> inclusion(String protocol, String command, boolean blocking,
+                                         Map<String, Object> body) {
         if (protocol == null || command == null)
             return Map.of("error", "protocol and command are required");
         return switch (protocol) {
             case "zwave"  -> zwaveController.inclusion(command, blocking);
             case "zigbee" -> zigbeeController.inclusion(command);
+            case "matter" -> commissionMatterDevice(str(body, "code"));
             default       -> Map.of("error", "unknown protocol: " + protocol);
         };
     }
@@ -171,17 +184,32 @@ public class GatewayApiService {
 
         // Cross-protocol commands
         if ("fwd_event".equals(cmd)) {
-            String ev = str(body, "ev");
             List<String> events = dev.getFwdEvents() == null
                     ? new ArrayList<>() : new ArrayList<>(dev.getFwdEvents());
-            if ("POST".equals(method) && ev != null && !events.contains(ev)) {
-                events.add(ev);
-            } else if ("DELETE".equals(method)) {
-                events.remove(ev);
+            switch (method) {
+                case "GET" -> { return Map.of("fwdEvents", events); }
+                case "POST" -> {
+                    String ev = str(body, "ev");
+                    if (ev != null && !events.contains(ev)) events.add(ev);
+                }
+                case "PUT" -> {
+                    Object raw = body.get("events");
+                    if (raw instanceof List<?> list) {
+                        events = list.stream()
+                                .filter(e -> e instanceof String)
+                                .map(e -> (String) e)
+                                .distinct()
+                                .collect(java.util.stream.Collectors.toCollection(ArrayList::new));
+                    }
+                }
+                case "DELETE" -> {
+                    String ev = str(body, "ev");
+                    events.remove(ev);
+                }
             }
             dev.setFwdEvents(events);
             deviceService.save(dev);
-            return Map.of("status", "ok");
+            return Map.of("status", "ok", "fwdEvents", events);
         }
 
         if ("name".equals(cmd) && "POST".equals(method)) {
@@ -378,7 +406,8 @@ public class GatewayApiService {
     private Map<String, Object> route(String method, String path, Map<String, Object> body) {
         // Fixed routes
         if (is("GET",    "/summary",   method, path)) return getSummary();
-        if (is("POST",   "/include",   method, path)) return inclusion(str(body,"protocol"), str(body,"command"), bool(body,"blocking"));
+        if (is("POST",   "/include",   method, path)) return inclusion(str(body,"protocol"), str(body,"command"), bool(body,"blocking"), body);
+        if (is("POST",   "/ota",       method, path)) return otaService.update(str(body,"url"), str(body,"checksum"));
         if (is("POST",   "/exclude",   method, path)) return exclusion(str(body,"protocol"), str(body,"command"), bool(body,"blocking"));
         if (is("POST",   "/timezone",  method, path)) return setTimezone(str(body,"timezone"));
         if (is("POST",   "/tunnel",    method, path)) return handleTunnel(body);
@@ -415,6 +444,12 @@ public class GatewayApiService {
                 case "DELETE" -> deleteScheduleItem(id);
                 default       -> Map.of("error", "method not allowed");
             };
+        }
+
+        // /audio/:cmd — audio inference service commands
+        if (path.startsWith("/audio/")) {
+            String cmd = path.substring("/audio/".length());
+            return handleAudioCommand(cmd, method, body);
         }
 
         // /zwave/:cmd  — Z-Wave network management commands
@@ -462,6 +497,42 @@ public class GatewayApiService {
         }
 
         return Map.of("error", "not found: " + method + " " + path);
+    }
+
+    // ── Audio commands ────────────────────────────────────────────────────────
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> handleAudioCommand(String cmd, String method, Map<String, Object> body) {
+        if (audioCommandService == null)
+            return Map.of("error", "audio service not enabled (audio.mqtt.enabled=false)");
+        return switch (cmd) {
+            case "status" -> audioResponseToMap(audioCommandService.sendStatus());
+            case "reload" -> audioResponseToMap(audioCommandService.sendReloadConfig());
+            case "learn"  -> {
+                int duration = intVal(body, "duration");
+                yield audioResponseToMap(audioCommandService.sendLearn(
+                        str(body, "camera_id"),
+                        str(body, "event_name"),
+                        duration > 0 ? duration : 30));
+            }
+            case "learn-apply" -> {
+                Map<String, Object> entry = (Map<String, Object>) body.get("entry");
+                yield audioResponseToMap(audioCommandService.sendLearnApply(
+                        str(body, "learn_id"),
+                        str(body, "event_name"),
+                        entry));
+            }
+            default -> Map.of("error", "unknown audio command: " + cmd
+                    + " — use: status | reload | learn | learn-apply");
+        };
+    }
+
+    private Map<String, Object> audioResponseToMap(AudioResponse response) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("action", response.getAction());
+        result.put("status", response.getStatus());
+        if (response.getData() != null) result.putAll(response.getData());
+        return result;
     }
 
     // ── Z-Wave network commands ───────────────────────────────────────────────
@@ -529,6 +600,53 @@ public class GatewayApiService {
     // ── Matter network commands ───────────────────────────────────────────────
 
     /**
+     * Commission a Matter device and return a device-summary response.
+     *
+     * 1. Calls python-matter-server commission_with_code (blocks up to 65 s).
+     * 2. Extracts node_id from the response.
+     * 3. Waits up to 3 s for node_added → setup() to write the DB entry.
+     * 4. Returns { status, device: <parseDevice summary> }.
+     *
+     * Used by both POST /include { protocol:"matter", code } and
+     * POST /matter/commission { code }.
+     */
+    private Map<String, Object> commissionMatterDevice(String code) {
+        if (code == null || code.isBlank()) return Map.of("error", "code is required");
+        try {
+            com.fasterxml.jackson.databind.JsonNode result =
+                    matterController.commissionWithCode(code)
+                            .get(65, java.util.concurrent.TimeUnit.SECONDS);
+
+            long nodeId = result != null ? result.path("node_id").asLong(-1) : -1;
+            if (nodeId < 0) return Map.of("error", "commissioning succeeded but no node_id in response");
+
+            // node_added fires asynchronously — wait for setup() to write the DB entry
+            String nodeStr = String.valueOf(nodeId);
+            Optional<Device> devOpt = Optional.empty();
+            for (int i = 0; i < 10; i++) {
+                devOpt = deviceService.findByNode(nodeStr);
+                if (devOpt.isPresent()) break;
+                Thread.sleep(300);
+            }
+
+            if (devOpt.isEmpty()) {
+                return Map.of("status", "commissioned", "node_id", nodeId,
+                        "note", "device entry not yet created — retry GET /summary");
+            }
+            Device dev = devOpt.get();
+            return Map.of("status", "ok", "device", matterController.parseDevice(dev.getId(), dev));
+
+        } catch (java.util.concurrent.TimeoutException e) {
+            return Map.of("error", "commissioning timed out");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Map.of("error", "interrupted");
+        } catch (Exception e) {
+            return Map.of("error", e.getMessage());
+        }
+    }
+
+    /**
      * POST /matter/commission  { code: "MT:Y..." }
      * POST /matter/remove      { node_id: 9 }
      * GET  /matter/nodes
@@ -536,18 +654,7 @@ public class GatewayApiService {
     public Map<String, Object> handleMatterNetwork(
             String cmd, String method, Map<String, Object> body) {
         return switch (cmd) {
-            case "commission" -> {
-                String code = str(body, "code");
-                if (code == null) yield Map.of("error", "code is required");
-                try {
-                    yield Map.of("result", matterController.commissionWithCode(code)
-                            .get(65, java.util.concurrent.TimeUnit.SECONDS));
-                } catch (java.util.concurrent.TimeoutException e) {
-                    yield Map.of("error", "commissioning timed out");
-                } catch (Exception e) {
-                    yield Map.of("error", e.getMessage());
-                }
-            }
+            case "commission" -> commissionMatterDevice(str(body, "code"));
             case "remove" -> {
                 Object nodeIdObj = body.get("node_id");
                 if (nodeIdObj == null) yield Map.of("error", "node_id is required");
@@ -638,11 +745,26 @@ public class GatewayApiService {
         int endpoint = body != null && body.get("endpoint") instanceof Number n
                 ? n.intValue() : 1;
 
+        // GET switch — read from node cache, no future needed
+        if ("switch".equals(cmd) && "GET".equals(method)) {
+            MatterNode cached = matterInterface.getNode(nodeId);
+            Object value = (cached != null && cached.raw() != null)
+                    ? MatterController.inferStatus(cached.raw().path("attributes"), "switch")
+                    : null;
+            return Map.of("status", "ok", "value", value != null ? value : "unknown");
+        }
+
         try {
             var future = switch (cmd) {
                 case "on"     -> matterController.turnOn(nodeId, endpoint);
                 case "off"    -> matterController.turnOff(nodeId, endpoint);
                 case "toggle" -> matterController.toggle(nodeId, endpoint);
+                case "switch" -> {
+                    String val = str(body, "value");
+                    yield "on".equals(val) || "true".equals(val)
+                            ? matterController.turnOn(nodeId, endpoint)
+                            : matterController.turnOff(nodeId, endpoint);
+                }
                 case "level"  -> {
                     int level = intVal(body, "value");
                     yield matterController.setLevel(nodeId, endpoint, level, 0);

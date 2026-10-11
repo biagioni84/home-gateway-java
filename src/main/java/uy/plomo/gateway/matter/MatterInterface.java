@@ -41,7 +41,14 @@ import java.util.concurrent.atomic.AtomicLong;
 public class MatterInterface extends TextWebSocketHandler {
 
     private static final int DEFAULT_TIMEOUT_MS  = 10_000;
-    private static final int RECONNECT_DELAY_MS  = 10_000;
+    private static final int RECONNECT_BASE_MS   =   5_000;
+    private static final int RECONNECT_MAX_MS    = 300_000; // 5 min cap
+
+    /** Current backoff delay; doubles on each failed attempt, resets on success. */
+    private volatile int reconnectDelayMs = RECONNECT_BASE_MS;
+    /** Guards against concurrent connect() calls from backoff + watchdog. */
+    private final java.util.concurrent.atomic.AtomicBoolean connecting =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     @Value("${matter.enabled:true}")
     private boolean enabled;
@@ -93,9 +100,10 @@ public class MatterInterface extends TextWebSocketHandler {
         }
         running = true;
         connect();
+        // Safety-net watchdog: catches edge cases where afterConnectionClosed doesn't fire
+        // (e.g. kernel TCP drop without FIN). Backoff handles normal reconnects.
         Scheduler.INSTANCE.scheduleWithFixedDelay(
-                this::reconnectIfNeeded,
-                RECONNECT_DELAY_MS, RECONNECT_DELAY_MS, TimeUnit.MILLISECONDS);
+                this::watchdog, 300_000L, 300_000L, TimeUnit.MILLISECONDS);
     }
 
     @PreDestroy
@@ -106,6 +114,10 @@ public class MatterInterface extends TextWebSocketHandler {
     }
 
     private void connect() {
+        if (!connecting.compareAndSet(false, true)) {
+            log.debug("Matter: connect already in progress — skipping");
+            return;
+        }
         try {
             // python-matter-server sends a large JSON dump on start_listening (all nodes +
             // all attributes). The default Tomcat WebSocket buffer (8 KB) is too small —
@@ -114,16 +126,32 @@ public class MatterInterface extends TextWebSocketHandler {
             container.setDefaultMaxTextMessageBufferSize(10 * 1024 * 1024);
             StandardWebSocketClient client = new StandardWebSocketClient(container);
             client.execute(this, serverUrl).get(5, TimeUnit.SECONDS);
+            // Success: afterConnectionEstablished will reset the delay and clear `connecting`
         } catch (Exception e) {
+            connecting.set(false);
             log.warn("Matter: connect to {} failed — {}", serverUrl, e.getMessage());
+            scheduleReconnect();
         }
     }
 
-    private void reconnectIfNeeded() {
+    /** Exponential backoff: 5 s → 10 s → 20 s → … → 300 s, ±20% jitter. */
+    private void scheduleReconnect() {
+        if (!running) return;
+        int delay = reconnectDelayMs;
+        reconnectDelayMs = (int) Math.min((long) reconnectDelayMs * 2, RECONNECT_MAX_MS);
+        int jitter = (int)(delay * 0.20 * (ThreadLocalRandom.current().nextDouble() * 2 - 1));
+        int effective = Math.max(1_000, delay + jitter);
+        log.info("Matter: reconnecting in {}ms (backoff={}ms)", effective, delay);
+        Scheduler.INSTANCE.schedule(
+                () -> eventExecutor.execute(this::connect), effective, TimeUnit.MILLISECONDS);
+    }
+
+    /** Safety-net: fires every 5 min to catch edge cases where afterConnectionClosed didn't fire. */
+    private void watchdog() {
         if (!running) return;
         if (session == null || !session.isOpen()) {
-            log.info("Matter: reconnecting to {}", serverUrl);
-            eventExecutor.execute(this::connect);
+            log.warn("Matter: watchdog detected dead session");
+            scheduleReconnect();
         }
     }
 
@@ -139,6 +167,8 @@ public class MatterInterface extends TextWebSocketHandler {
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
         this.session = session;
+        reconnectDelayMs = RECONNECT_BASE_MS; // reset backoff on successful connect
+        connecting.set(false);
         log.info("Matter: connected");
         // start_listening is fire-and-forget — response is handled in handleResponse()
         doSend(String.valueOf(messageIdCounter.getAndIncrement()), "start_listening", null);
@@ -148,9 +178,11 @@ public class MatterInterface extends TextWebSocketHandler {
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
         log.warn("Matter: connection closed — {}", status);
         this.session = null;
+        connecting.set(false);
         pending.forEach((id, f) ->
                 f.completeExceptionally(new IOException("Matter WS disconnected")));
         pending.clear();
+        scheduleReconnect();
     }
 
     @Override

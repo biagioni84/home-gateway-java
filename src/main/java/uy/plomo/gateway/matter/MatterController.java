@@ -180,7 +180,7 @@ public class MatterController {
      *   switch / dimmer — OnOff cluster (6) attr 0; dimmer also reads Level cluster (8) attr 0
      *   lock            — DoorLock cluster (257) attr 0: 1=unlocked, 2=locked
      */
-    static Object inferStatus(JsonNode attrs, String type) {
+    public static Object inferStatus(JsonNode attrs, String type) {
         if (attrs == null || type == null) return null;
         return switch (type) {
             case "switch" -> {

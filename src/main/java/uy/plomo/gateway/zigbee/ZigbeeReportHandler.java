@@ -6,6 +6,7 @@ import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 import uy.plomo.gateway.device.Device;
 import uy.plomo.gateway.device.DeviceService;
+import uy.plomo.gateway.diagnostics.UnhandledFrameStore;
 import uy.plomo.gateway.mqtt.MqttService;
 import uy.plomo.gateway.telemetry.TelemetryBuffer;
 
@@ -25,8 +26,9 @@ import java.util.concurrent.CompletableFuture;
 @RequiredArgsConstructor
 public class ZigbeeReportHandler {
 
-    private final DeviceService   deviceService;
-    private final TelemetryBuffer telemetryBuffer;
+    private final DeviceService       deviceService;
+    private final TelemetryBuffer     telemetryBuffer;
+    private final UnhandledFrameStore unhandledFrameStore;
     @Lazy private final MqttService       mqttService;
     @Lazy private final ZigbeeController  zigbeeController;
 
@@ -72,11 +74,11 @@ public class ZigbeeReportHandler {
         forwardEventIfConfigured(node, command, msg);
 
         switch (command) {
-            case "ReportAttributes"          -> handleReportAttributes(msg);
-            case "GetPINCodeResponse"        -> handlePincodeResponse(msg);
+            case "ReportAttributes"           -> handleReportAttributes(msg);
+            case "GetPINCodeResponse"         -> handlePincodeResponse(msg);
             case "OperationEventNotification" -> handleOperationEvent(msg);
             case "GetWeekdayScheduleResponse" -> handleWeekdayScheduleResponse(msg);
-            default                           -> {} // hook responses handled in ZigbeeController
+            default -> unhandledFrameStore.record("zigbee", node, cluster, command, null);
         }
     }
 
@@ -95,7 +97,7 @@ public class ZigbeeReportHandler {
             switch (cluster != null ? cluster : "") {
                 case "DoorLock"            -> handleDoorLockReport(dev, bytes);
                 case "PowerConfiguration"  -> handleBatteryReport(dev, bytes);
-                default -> log.debug("ReportAttributes: unhandled cluster {} for node {}", cluster, node);
+                default -> unhandledFrameStore.record("zigbee", node, cluster, "ReportAttributes", null);
             }
             deviceService.save(dev);
         }, () -> log.debug("ReportAttributes: no device for node {}", node));

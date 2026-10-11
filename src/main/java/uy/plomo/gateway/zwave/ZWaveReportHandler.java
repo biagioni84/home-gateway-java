@@ -10,6 +10,7 @@ import uy.plomo.gateway.descriptor.ResolvedDescriptor;
 import uy.plomo.gateway.descriptor.ZWaveDescriptor;
 import uy.plomo.gateway.device.Device;
 import uy.plomo.gateway.device.DeviceService;
+import uy.plomo.gateway.diagnostics.UnhandledFrameStore;
 import uy.plomo.gateway.mqtt.MqttService;
 import uy.plomo.gateway.telemetry.TelemetryBuffer;
 
@@ -33,10 +34,11 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class ZWaveReportHandler {
 
-    private final DeviceService          deviceService;
+    private final DeviceService           deviceService;
     private final DeviceDescriptorService descriptorService;
-    private final ObjectMapper           objectMapper;
-    private final TelemetryBuffer        telemetryBuffer;
+    private final ObjectMapper            objectMapper;
+    private final TelemetryBuffer         telemetryBuffer;
+    private final UnhandledFrameStore     unhandledFrameStore;
     @Lazy private final MqttService       mqttService;
     @Lazy private final ZWaveController   zwaveController;
 
@@ -83,11 +85,12 @@ public class ZWaveReportHandler {
 
         if (!command.contains("_REPORT") && !command.contains("NODE_LIST")
                 && !"WAKE_UP_NOTIFICATION".equals(command)) {
+            unhandledFrameStore.record("zwave", nodeHex, commandClass, command, fields);
             return;
         }
 
         try {
-            handleReport(srcNodeId, nodeHex, command, fields, devOpt);
+            handleReport(srcNodeId, nodeHex, commandClass, command, fields, devOpt);
         } catch (Exception e) {
             log.error("Error handling report {} from node {}", command, nodeHex, e);
         }
@@ -95,8 +98,8 @@ public class ZWaveReportHandler {
 
     // ── Report dispatch ───────────────────────────────────────────────────────
 
-    private void handleReport(int srcNodeId, String nodeHex, String command, Map<String, Object> fields,
-                              Optional<Device> devOpt) {
+    private void handleReport(int srcNodeId, String nodeHex, String commandClass, String command,
+                              Map<String, Object> fields, Optional<Device> devOpt) {
         if ("NODE_LIST_REPORT".equals(command) || "COMMAND_NODE_LIST_REPORT".equals(command)) {
             handleNodeListReport(fields);
             return;
@@ -146,7 +149,7 @@ public class ZWaveReportHandler {
                                                  -> handleYearDayReport(dev, fields, now);
             case "SCHEDULE_ENTRY_LOCK_DAILY_REPEATING_REPORT"
                                                  -> handleDailyRepeatingReport(dev, fields, now);
-            default                              -> handleGenericReport(dev, command, fields, now);
+            default                              -> handleGenericReport(dev, commandClass, command, fields, now);
         }
 
         deviceService.save(dev);
@@ -339,8 +342,10 @@ public class ZWaveReportHandler {
         }
     }
 
-    private void handleGenericReport(Device dev, String command, Map<String, Object> fields, String now) {
+    private void handleGenericReport(Device dev, String commandClass, String command,
+                                     Map<String, Object> fields, String now) {
         dev.setAttribute(command, "data", payloadToMap(fields, now));
+        unhandledFrameStore.record("zwave", dev.getNode(), commandClass, command, fields);
     }
 
     // ── Node list report ──────────────────────────────────────────────────────

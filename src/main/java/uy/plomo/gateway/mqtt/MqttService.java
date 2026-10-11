@@ -41,8 +41,8 @@ import java.util.regex.Pattern;
 public class MqttService {
 
     private static final int CONNECT_TIMEOUT_SECONDS = 30;
-    private static final long RECONNECT_MIN_MS = 1_000;
-    private static final long RECONNECT_MAX_MS = 30_000;
+    private static final long RECONNECT_MIN_MS =   1_000;
+    private static final long RECONNECT_MAX_MS = 300_000; // 5 min — limits hammering during mass outages
 
     @Value("${aws.iot.endpoint}")
     private String endpoint;
